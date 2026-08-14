@@ -1,0 +1,27 @@
+# Dữ liệu lake (bind-mount MinIO) — không đẩy lên git
+lakehouse/*
+!lakehouse/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# dbt
+dbt_omnipay/target/
+dbt_omnipay/dbt_packages/
+dbt_omnipay/logs/
+*.duckdb
+*.duckdb.wal
+
+# Flink
+flink_app/**/checkpoints/
+flink_app/**/savepoints/
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
