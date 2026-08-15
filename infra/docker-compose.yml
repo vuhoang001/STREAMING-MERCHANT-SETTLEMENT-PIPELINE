@@ -1,0 +1,220 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# OmniPay — Hạ tầng local (Bước 1)
+#
+# PROFILES — bật từng phần cho nhẹ máy (điều khiển qua Makefile):
+#   infra      → Redpanda + Console + MinIO + Postgres        (nền, luôn cần)
+#   flink      → JobManager + TaskManager                     (phần nặng RAM)
+#   streaming  → infra + flink                                (làm streaming: dùng cái này)
+#   viz        → Grafana + Metabase                           (Bước 5, mặc định TẮT)
+#   all        → tất cả
+#
+# KHÔNG service nào chạy khi `docker compose up` trần — mọi service đều có profile.
+# Đang làm streaming trước nên bạn hầu như chỉ cần: make up-streaming
+# ═══════════════════════════════════════════════════════════════════════════
+
+name: omnipay
+
+# ── Anchor dùng chung cho JobManager & TaskManager (cùng image tự build) ──
+x-flink-common: &flink-common
+  image: omnipay/flink:${FLINK_VERSION}
+  build:
+    context: ./flink
+    args:
+      FLINK_VERSION: ${FLINK_VERSION}
+  profiles: ["flink", "streaming", "all"]
+  environment: &flink-env
+    # Official entrypoint gộp FLINK_PROPERTIES vào config Flink.
+    FLINK_PROPERTIES: |
+      jobmanager.rpc.address: flink-jobmanager
+      jobmanager.memory.process.size: 1600m
+      taskmanager.memory.process.size: 2048m
+      taskmanager.numberOfTaskSlots: 4
+      state.backend: rocksdb
+      state.backend.incremental: true
+      execution.checkpointing.interval: 60s
+      execution.checkpointing.mode: EXACTLY_ONCE
+      execution.checkpointing.min-pause: 30s
+      state.checkpoints.dir: s3://flink-checkpoints/checkpoints
+      state.savepoints.dir: s3://flink-savepoints/savepoints
+      s3.endpoint: http://minio:9000
+      s3.path.style.access: true
+      s3.access-key: ${MINIO_ROOT_USER}
+      s3.secret-key: ${MINIO_ROOT_PASSWORD}
+      rest.flamegraph.enabled: true
+  volumes:
+    # Mount code job vào container để submit: flink run -py /opt/flink/jobs/...
+    - ../flink_app:/opt/flink/jobs:ro
+  networks: [omnipay]
+
+services:
+
+  # ─────────────────────────────── Redpanda (Kafka API) ───────────────────
+  redpanda:
+    image: redpandadata/redpanda:${REDPANDA_VERSION}
+    # "flink" có ở đây vì Flink depends_on redpanda — bật profile flink phải kéo theo.
+    profiles: ["infra", "streaming", "flink", "all"]
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container        # tự lo overprovision cho máy dev
+      - --smp=1
+      - --kafka-addr=internal://0.0.0.0:29092,external://0.0.0.0:9092
+      # internal: cho các container khác gọi (redpanda:29092)
+      # external: cho host gọi (localhost:9092)
+      - --advertise-kafka-addr=internal://redpanda:29092,external://localhost:9092
+    ports:
+      - "9092:9092"     # Kafka API cho host
+      - "9644:9644"     # admin/metrics
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      # "container up" != "cluster ready" — chờ cluster thật sự healthy.
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks: [omnipay]
+
+  console:
+    image: redpandadata/console:${REDPANDA_CONSOLE_VERSION}
+    profiles: ["infra", "streaming", "all"]
+    environment:
+      KAFKA_BROKERS: redpanda:29092
+    ports:
+      - "8080:8080"     # xem topic/message
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks: [omnipay]
+
+  # ─────────────────────────────── MinIO (lakehouse S3) ───────────────────
+  minio:
+    image: minio/minio:${MINIO_VERSION}
+    profiles: ["infra", "streaming", "flink", "all"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"     # S3 API
+      - "9001:9001"     # Console
+    volumes:
+      - minio-data:/data
+    networks: [omnipay]
+    # Không healthcheck ở đây (image minio không chắc có curl/bash);
+    # readiness được gate bằng minio-init chạy `mc ready` bên dưới.
+
+  minio-init:
+    image: minio/mc:${MC_VERSION}
+    profiles: ["infra", "streaming", "flink", "all"]
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}; do echo 'chờ minio...'; sleep 1; done;
+      mc ready local;
+      mc mb -p local/omnipay-bronze local/omnipay-silver local/omnipay-gold local/flink-checkpoints local/flink-savepoints;
+      echo 'MinIO buckets sẵn sàng';
+      "
+    networks: [omnipay]
+
+  # ─────────────────────────────── Postgres (CDC source + serving) ────────
+  postgres:
+    image: postgres:${POSTGRES_VERSION}
+    profiles: ["infra", "streaming", "flink", "all"]
+    command:
+      # wal_level=logical BẮT BUỘC cho Debezium CDC (README §8). Set ngay từ đầu
+      # để Bước 3 khỏi phải quay lại sửa.
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5433:5432"     # host 5433 (tránh đụng Postgres máy), container 5432
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [omnipay]
+
+  # ─────────────────────────────── Flink ──────────────────────────────────
+  flink-jobmanager:
+    <<: *flink-common
+    command: jobmanager
+    ports:
+      - "8088:8081"     # UI ở 8088 (README §7, tránh đụng 8080 của Console)
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully   # chờ bucket tạo xong
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/config >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  flink-taskmanager:
+    <<: *flink-common
+    command: taskmanager
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2500m   # chặn trần RAM cho nhẹ máy
+
+  # ─────────────────────────────── Viz (Bước 5 — mặc định TẮT) ────────────
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION}
+    profiles: ["viz", "all"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [omnipay]
+
+  metabase:
+    image: metabase/metabase:${METABASE_VERSION}
+    profiles: ["viz", "all"]
+    ports:
+      - "3001:3000"
+    # Lab: dùng app-DB nội bộ (H2) cho gọn. Production: trỏ MB_DB_* sang Postgres riêng.
+    networks: [omnipay]
+
+networks:
+  omnipay:
+    name: omnipay
+
+volumes:
+  redpanda-data:
+  minio-data:
+  postgres-data:
+  grafana-data:
