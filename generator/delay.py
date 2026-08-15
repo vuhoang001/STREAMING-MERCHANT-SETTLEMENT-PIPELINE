@@ -1,0 +1,1 @@
+# 3% lùi timestamp 5-60s, 0.5% lùi > 10 phút (thử watermark/side output)

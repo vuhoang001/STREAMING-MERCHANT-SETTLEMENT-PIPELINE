@@ -9,6 +9,9 @@ __pycache__/
 venv/
 .env
 
+# Generator runtime output (ground-truth nhãn, sinh lại mỗi lần chạy)
+generator/injected_labels.jsonl
+
 # dbt
 dbt_omnipay/target/
 dbt_omnipay/dbt_packages/
